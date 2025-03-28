@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
+import contextlib
 import glob
 from dataclasses import dataclass
 from functools import lru_cache
@@ -18,14 +19,33 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+# torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+CA = False
+PROFILE = False
+SHORT_RUN = False
+FAKE_PG = False
+PACGHOOK = False
+BACKEND="inductor"
+if CA:
+    torch._dynamo.config.compiled_autograd = True
+    # torch._inductor.config.reorder_for_locality = False
+
+    # These options don't work on this graph pattern right now :(
+    # they actually slow things down further; but we should expect more speedups if we can fix them
+    # torch._inductor.config.reorder_for_compute_comm_overlap = True
+    # torch._inductor.config._fuse_ddp_communication = True
+    def ca_ctx():
+        return torch._dynamo.compiled_autograd._enable(torch.compile(backend=BACKEND))
+else:
+    ca_ctx = contextlib.nullcontext
+
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
+    @torch.compile(backend=BACKEND)
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
@@ -52,7 +72,7 @@ def _(x: Tensor, w: Tensor, *_):
 
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
+    @torch.compile(backend=BACKEND)
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
         x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
@@ -104,7 +124,7 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-@torch.compile
+@torch.compile(backend=BACKEND)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -438,6 +458,11 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
+def get_iters():
+    if SHORT_RUN:
+        return 20
+    return 1770
+
 @dataclass
 class Hyperparameters:
     # data
@@ -447,7 +472,8 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1770 # number of iterations to run
+    # num_iterations = 1770 # number of iterations to run
+    num_iterations = get_iters()
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -460,10 +486,20 @@ args = Hyperparameters()
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert world_size == 8 # this code is designed for 8xH100
+if torch._inductor.config._fuse_ddp_communication:
+    def pacghook(param):
+        dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
+else:
+    def pacghook(param):
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+if FAKE_PG:
+    store = dist.HashStore()
+    dist.init_process_group(backend="fake", rank=0, world_size=8, device_id=device, store=store)
+else:
+    dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -544,7 +580,13 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+if PACGHOOK:
+    for param in model.parameters():
+        param.register_post_accumulate_grad_hook(pacghook)
+# torch._dynamo.config.optimize_ddp = "python_reducer"
+# from torch.nn.parallel import DistributedDataParallel as DDP
+# model = DDP(model, bucket_cap_mb=2147483647)
+model: nn.Module = torch.compile(model, backend=BACKEND, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
@@ -556,7 +598,8 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    with ca_ctx():
+        model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
@@ -578,62 +621,82 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
 
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+# prof = None
+# stack = None
+if PROFILE:
+    prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+else:
+    prof = contextlib.nullcontext()
+with prof:
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets = next(val_loader)
+                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+            val_loss /= val_steps
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # set optimization hyperparameters
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-    for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
-    for opt in optimizers:
-        opt.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
 
-print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        with ca_ctx():
+            model(inputs, targets, get_window_size_blocks(step)).backward()
+        if not PACGHOOK:
+            for param in model.parameters():
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # set optimization hyperparameters
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
+        for group in optimizer2.param_groups:
+            frac = min(step / 300, 1) # momentum warmup for muon
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers
+        for opt in optimizers:
+            opt.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+if PROFILE and rank == 0:
+    # assert stack is not None
+    # assert prof is not None
+    if CA:
+        name = "modded_nanogpt_ca.json"
+    else:
+        name = "modded_nanogpt.json"
+    print(f"exporting trace to {name}")
+    prof.export_chrome_trace(name)
 dist.destroy_process_group()

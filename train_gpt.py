@@ -30,14 +30,17 @@ if CA:
     torch._dynamo.config.compiled_autograd = True
     # torch._inductor.config.reorder_for_locality = False
 
-    # These options don't work on this graph pattern right now :(
-    # they actually slow things down further; but we should expect more speedups if we can fix them
+    # These options actually slow things down further; but we should expect more speedups if we can fix them
     # torch._inductor.config.reorder_for_compute_comm_overlap = True
     # torch._inductor.config._fuse_ddp_communication = True
     def ca_ctx():
         return torch._dynamo.compiled_autograd._enable(torch.compile(backend=BACKEND))
 else:
     ca_ctx = contextlib.nullcontext
+
+def printo(*args, **kwargs):
+    if rank == 0:
+        print(*args, **kwargs)
 
 
 # -----------------------------------------------------------------------------
@@ -175,7 +178,8 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, custom_wait=None):
+        self.custom_wait = custom_wait
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
@@ -190,6 +194,7 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        assert self.custom_wait
         for group in self.param_groups:
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
@@ -205,6 +210,9 @@ class Muon(torch.optim.Optimizer):
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
+                    if self.custom_wait:
+                        self.custom_wait(p)
+                        # torch.ops._c10d_functional.wait_tensor.default(p.grad)
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -486,12 +494,6 @@ args = Hyperparameters()
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert world_size == 8 # this code is designed for 8xH100
-if torch._inductor.config._fuse_ddp_communication:
-    def pacghook(param):
-        dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
-else:
-    def pacghook(param):
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -547,13 +549,55 @@ embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
+
+handles = {}
+param_grad_order = []
+def reset_handles():
+    global handles
+    handles = {id(p): None for p in model.parameters()}
+    global param_grad_order 
+    param_grad_order = []
+reset_handles()
+
+def my_custom_wait(param):
+    # if rank == 0:
+    #     print(f"waiting on {id(param)}, {param_to_optim[id(param)]}")
+    torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=head_params, lr=0.22), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-optimizers = [optimizer1, optimizer2]
+adam_kwargs = {
+    "betas": (0.8, 0.95),
+    "eps": 1e-10,
+    "fused": True,
+    "custom_wait": my_custom_wait,
+}
+param_to_optim = {}
+for param in embed_params:
+    param_to_optim[id(param)] = "embed_params"
+for param in scalar_params:
+    param_to_optim[id(param)] = "scalar_params"
+for param in head_params:
+    param_to_optim[id(param)] = "head_params"
+for param in hidden_matrix_params:
+    param_to_optim[id(param)] = "hidden_matrix_params"
+
+from torch._logging import trace_structured
+trace_structured(
+    "artifact",
+    metadata_fn=lambda: {
+        "name": "params_to_optim",
+        "encoding": "json",
+    },
+    payload_fn=lambda: param_to_optim,
+)
+
+optimizer1 = torch.optim.Adam(adam_params, **adam_kwargs)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, custom_wait=my_custom_wait)
+optimizer3 = torch.optim.Adam([dict(params=embed_params, lr=0.6)], **adam_kwargs)
+optimizers = [optimizer3, optimizer2, optimizer1]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -580,6 +624,18 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+async_pg = torch.distributed.new_group(backend="nccl")
+if torch._inductor.config._fuse_ddp_communication:
+    def pacghook(param):
+        dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
+else:
+    def pacghook(param):
+        # dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        param_grad_order.append((id(param), param_to_optim[id(param)]))
+        handle = torch.ops._c10d_functional.all_reduce(param.grad, "avg", async_pg.group_name)
+        # torch.ops.symm_mem.multimem_all_reduce_(param.grad, "sum", embed_pg.group_name)
+        handles[id(param)] = handle
+
 if PACGHOOK:
     for param in model.parameters():
         param.register_post_accumulate_grad_hook(pacghook)
@@ -596,14 +652,39 @@ model: nn.Module = torch.compile(model, backend=BACKEND, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+if rank == 0:
+    print("starting warmup")
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
+    reset_handles()
     with ca_ctx():
         model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    for opt in optimizers:
-        opt.step()
+        # for param_id, handle in handles.items():
+        #     torch.ops._c10d_functional.wait_tensor.default(handle)
+    # for param in model.parameters():
+    #     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    # for handle in handles.values():
+    #     torch.ops._c10d_functional.wait_tensor.default(handle) 
+
+    # for opt in optimizers:
+    #     opt.step()
+    optimizers[0].step()
+    for param in embed_params:
+        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+    # print(param_grad_order)
+    optimizers[1].step()
+    for param in hidden_matrix_params:
+        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+    optimizers[2].step()
+    for param in head_params:
+        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+    for param in scalar_params:
+        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+    reset_handles()
     model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
@@ -613,7 +694,8 @@ del initial_state
 ########################################
 #        Training and validation       #
 ########################################
-
+if rank == 0:
+    print("starting for real")
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
 training_time_ms = 0
 # start the clock
@@ -630,6 +712,7 @@ else:
     prof = contextlib.nullcontext()
 with prof:
     for step in range(train_steps + 1):
+        # printo(f"================ ITERATION {step} =========================")
         last_step = (step == train_steps)
 
         # --------------- VALIDATION SECTION -----------------
@@ -667,7 +750,10 @@ with prof:
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
         with ca_ctx():
+            reset_handles()
             model(inputs, targets, get_window_size_blocks(step)).backward()
+            # for param_id, handle in handles.items():
+            #     torch.ops._c10d_functional.wait_tensor.default(handle)
         if not PACGHOOK:
             for param in model.parameters():
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
@@ -679,9 +765,33 @@ with prof:
             frac = min(step / 300, 1) # momentum warmup for muon
             group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
         # step the optimizers
-        for opt in optimizers:
-            opt.step()
+        optimizers[0].step()
+        for param in embed_params:
+            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        optimizers[1].step()
+        for param in hidden_matrix_params:
+            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        optimizers[2].step()
+        for param in head_params:
+            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        for param in scalar_params:
+            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        # for opt in optimizers:
+        #     opt.step()
         # null the gradients
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": f"param_grad_order_actual_{step}",
+                "encoding": "json",
+            },
+            payload_fn=lambda: param_grad_order,
+        )
+        reset_handles()
         model.zero_grad(set_to_none=True)
         # logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

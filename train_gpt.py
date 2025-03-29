@@ -20,11 +20,12 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-CA = False
+CA = True
 PROFILE = False
 SHORT_RUN = False
 FAKE_PG = False
-PACGHOOK = False
+PACGHOOK = True
+ASYNC_AR = True
 BACKEND="inductor"
 if CA:
     torch._dynamo.config.compiled_autograd = True
@@ -212,7 +213,6 @@ class Muon(torch.optim.Optimizer):
                     p = params[base_i + self.rank]
                     if self.custom_wait:
                         self.custom_wait(p)
-                        # torch.ops._c10d_functional.wait_tensor.default(p.grad)
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -467,8 +467,10 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # int main
 
 def get_iters():
+    if PROFILE:
+        return 600
     if SHORT_RUN:
-        return 20
+        return 5
     return 1770
 
 @dataclass
@@ -498,11 +500,12 @@ assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 if FAKE_PG:
-    store = dist.HashStore()
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+    store = FakeStore()
     dist.init_process_group(backend="fake", rank=0, world_size=8, device_id=device, store=store)
 else:
     dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
+
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
@@ -559,10 +562,12 @@ def reset_handles():
     param_grad_order = []
 reset_handles()
 
-def my_custom_wait(param):
-    # if rank == 0:
-    #     print(f"waiting on {id(param)}, {param_to_optim[id(param)]}")
-    torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+if ASYNC_AR:
+    def my_custom_wait(param):
+        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+else:
+    def my_custom_wait(param):
+        pass
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.22), dict(params=scalar_params, lr=0.04)]
@@ -584,7 +589,18 @@ for param in head_params:
 for param in hidden_matrix_params:
     param_to_optim[id(param)] = "hidden_matrix_params"
 
+torch._dynamo.compiled_autograd.param_to_optim = param_to_optim
+
 from torch._logging import trace_structured
+trace_structured(
+    "artifact",
+    metadata_fn=lambda: {
+        "name": "train_gpt_config",
+        "encoding": "string",
+    },
+    payload_fn=lambda: f"CA={CA}, PROFILE={PROFILE}, SHORT_RUN={SHORT_RUN}, FAKE_PG={FAKE_PG}, PACGHOOK={PACGHOOK}, ASYNC_AR={ASYNC_AR}, BACKEND={BACKEND}",
+)
+
 trace_structured(
     "artifact",
     metadata_fn=lambda: {
@@ -624,17 +640,25 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-async_pg = torch.distributed.new_group(backend="nccl")
 if torch._inductor.config._fuse_ddp_communication:
     def pacghook(param):
         dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
 else:
-    def pacghook(param):
-        # dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        param_grad_order.append((id(param), param_to_optim[id(param)]))
-        handle = torch.ops._c10d_functional.all_reduce(param.grad, "avg", async_pg.group_name)
-        # torch.ops.symm_mem.multimem_all_reduce_(param.grad, "sum", embed_pg.group_name)
-        handles[id(param)] = handle
+    if ASYNC_AR:
+        if FAKE_PG:
+            async_pg = torch.distributed.new_group(backend="fake")
+        else:
+            async_pg = torch.distributed.new_group(backend="nccl")
+        
+        def pacghook(param):
+            param_grad_order.append((id(param), param_to_optim[id(param)]))
+            handle = torch.ops._c10d_functional.all_reduce(param.grad, "avg", async_pg.group_name)
+            # torch.ops.symm_mem.multimem_all_reduce_(param.grad, "sum", embed_pg.group_name)
+            handles[id(param)] = handle
+    else:
+        def pacghook(param):
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
 
 if PACGHOOK:
     for param in model.parameters():
@@ -659,31 +683,17 @@ for _ in range(warmup_steps):
     reset_handles()
     with ca_ctx():
         model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-        # for param_id, handle in handles.items():
-        #     torch.ops._c10d_functional.wait_tensor.default(handle)
-    # for param in model.parameters():
-    #     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # for handle in handles.values():
-    #     torch.ops._c10d_functional.wait_tensor.default(handle) 
-
-    # for opt in optimizers:
-    #     opt.step()
     optimizers[0].step()
     for param in embed_params:
-        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
-    # print(param_grad_order)
+        my_custom_wait(param)
     optimizers[1].step()
     for param in hidden_matrix_params:
-        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        my_custom_wait(param)
     optimizers[2].step()
     for param in head_params:
-        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        my_custom_wait(param)
     for param in scalar_params:
-        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-        # torch.ops._c10d_functional.wait_tensor.default(param.grad)
+        my_custom_wait(param)
     reset_handles()
     model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
@@ -704,101 +714,99 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 
-# prof = None
-# stack = None
 if PROFILE:
     prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
 else:
     prof = contextlib.nullcontext()
-with prof:
-    for step in range(train_steps + 1):
-        # printo(f"================ ITERATION {step} =========================")
-        last_step = (step == train_steps)
 
-        # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            model.eval()
-            val_batch_size = world_size * args.val_seq_len
-            assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
-            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-            val_loss = 0
-            with torch.no_grad():
-                for _ in range(val_steps):
-                    inputs, targets = next(val_loader)
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
-            val_loss /= val_steps
-            del val_loader
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-            model.train()
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+profile_on = False
+# with prof:
+stack = contextlib.ExitStack()
+for step in range(train_steps + 1):
+    # printo(f"================ ITERATION {step} =========================")
+    last_step = (step == train_steps)
 
-        if last_step:
-            if master_process and args.save_checkpoint:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                os.makedirs(f"logs/{run_id}", exist_ok=True)
-                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-            # the last step only has the validation loop, so break to avoid training
-            break
+    if step > train_steps - 20 and not profile_on:
+        profile_on = True
+        stack.enter_context(prof)
 
-        # --------------- TRAINING SECTION -----------------
-        inputs, targets = next(train_loader)
-        with ca_ctx():
-            reset_handles()
-            model(inputs, targets, get_window_size_blocks(step)).backward()
-            # for param_id, handle in handles.items():
-            #     torch.ops._c10d_functional.wait_tensor.default(handle)
-        if not PACGHOOK:
-            for param in model.parameters():
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        # set optimization hyperparameters
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * get_lr(step)
-        for group in optimizer2.param_groups:
-            frac = min(step / 300, 1) # momentum warmup for muon
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-        # step the optimizers
-        optimizers[0].step()
-        for param in embed_params:
-            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
-        optimizers[1].step()
-        for param in hidden_matrix_params:
-            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
-        optimizers[2].step()
-        for param in head_params:
-            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
-        for param in scalar_params:
-            torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
-            # torch.ops._c10d_functional.wait_tensor.default(param.grad)
-        # for opt in optimizers:
-        #     opt.step()
-        # null the gradients
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": f"param_grad_order_actual_{step}",
-                "encoding": "json",
-            },
-            payload_fn=lambda: param_grad_order,
-        )
+    # --------------- VALIDATION SECTION -----------------
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.eval()
+        val_batch_size = world_size * args.val_seq_len
+        assert args.val_tokens % val_batch_size == 0
+        val_steps = args.val_tokens // val_batch_size
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+        val_loss = 0
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets = next(val_loader)
+                val_loss += model(inputs, targets, get_window_size_blocks(step))
+        val_loss /= val_steps
+        del val_loader
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        model.train()
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    if last_step:
+        if master_process and args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        # the last step only has the validation loop, so break to avoid training
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    with ca_ctx():
         reset_handles()
-        model.zero_grad(set_to_none=True)
-        # logging
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        model(inputs, targets, get_window_size_blocks(step)).backward()
+    if not PACGHOOK:
+        for param in model.parameters():
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    # set optimization hyperparameters
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
+    for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) # momentum warmup for muon
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    # step the optimizers
+    optimizers[0].step()
+    for param in embed_params:
+        my_custom_wait(param)
+    optimizers[1].step()
+    for param in hidden_matrix_params:
+        my_custom_wait(param)
+    optimizers[2].step()
+    for param in head_params:
+        my_custom_wait(param)
+    for param in scalar_params:
+        my_custom_wait(param)
+    # null the gradients
+    trace_structured(
+        "artifact",
+        metadata_fn=lambda: {
+            "name": f"param_grad_order_actual_{step}",
+            "encoding": "json",
+        },
+        payload_fn=lambda: param_grad_order,
+    )
+    reset_handles()
+    model.zero_grad(set_to_none=True)
+    # logging
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
-    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+stack.close()
 
 if PROFILE and rank == 0:
     # assert stack is not None

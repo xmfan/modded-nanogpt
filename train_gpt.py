@@ -26,6 +26,9 @@ SHORT_RUN = False
 FAKE_PG = False
 PACGHOOK = True
 ASYNC_AR = True
+if ASYNC_AR:
+    assert PACGHOOK
+ASYNC_PG = False
 BACKEND="inductor"
 if CA:
     torch._dynamo.config.compiled_autograd = True
@@ -43,6 +46,20 @@ def printo(*args, **kwargs):
     if rank == 0:
         print(*args, **kwargs)
 
+
+if ASYNC_AR:
+    def remove_waits(graph):
+        if not torch._dynamo.compiled_autograd.in_compiled_autograd_region:
+            return graph
+
+        for wait_node in graph.find_nodes(op="call_function", target=torch.ops._c10d_functional.wait_tensor.default):
+            all_reduce_node = wait_node.args[0]
+            wait_node.replace_all_uses_with(all_reduce_node)
+            graph.erase_node(wait_node)
+
+        return graph
+
+    torch._inductor.config.post_grad_custom_post_pass = remove_waits
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -195,7 +212,6 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
-        assert self.custom_wait
         for group in self.param_groups:
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
@@ -467,8 +483,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # int main
 
 def get_iters():
-    if PROFILE:
-        return 600
+    # if PROFILE:
+    #     return 600
     if SHORT_RUN:
         return 5
     return 1770
@@ -553,24 +569,13 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 
-handles = {}
-param_grad_order = []
-def reset_handles():
-    global handles
-    handles = {id(p): None for p in model.parameters()}
-    global param_grad_order 
-    param_grad_order = []
-reset_handles()
-
 if ASYNC_AR:
     def my_custom_wait(param):
-        torch.ops._c10d_functional.wait_tensor.default(handles[id(param)])
+        torch.ops._c10d_functional.wait_tensor.default(param.grad)
 else:
-    def my_custom_wait(param):
-        pass
+    my_custom_wait = None
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 adam_kwargs = {
@@ -610,13 +615,22 @@ trace_structured(
     payload_fn=lambda: param_to_optim,
 )
 
-optimizer1 = torch.optim.Adam(adam_params, **adam_kwargs)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, custom_wait=my_custom_wait)
-optimizer3 = torch.optim.Adam([dict(params=embed_params, lr=0.6)], **adam_kwargs)
-optimizers = [optimizer3, optimizer2, optimizer1]
+if ASYNC_AR:
+    adam_params = [dict(params=head_params, lr=0.22), dict(params=scalar_params, lr=0.04)]
+    optimizer1 = torch.optim.Adam(adam_params, **adam_kwargs)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, custom_wait=my_custom_wait)
+    optimizer3 = torch.optim.Adam([dict(params=embed_params, lr=0.6)], **adam_kwargs)
+    optimizers = [optimizer1, optimizer2, optimizer3]
+else:
+    adam_params = [dict(params=head_params, lr=0.22), dict(params=scalar_params, lr=0.04), dict(params=embed_params, lr=0.6)]
+    optimizer1 = torch.optim.Adam(adam_params, **adam_kwargs)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, custom_wait=my_custom_wait)
+    optimizers = [optimizer1, optimizer2]
+
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -640,24 +654,21 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-if torch._inductor.config._fuse_ddp_communication:
-    def pacghook(param):
-        dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
-else:
-    if ASYNC_AR:
-        if FAKE_PG:
-            async_pg = torch.distributed.new_group(backend="fake")
-        else:
-            async_pg = torch.distributed.new_group(backend="nccl")
-        
-        def pacghook(param):
-            param_grad_order.append((id(param), param_to_optim[id(param)]))
-            handle = torch.ops._c10d_functional.all_reduce(param.grad, "avg", async_pg.group_name)
-            # torch.ops.symm_mem.multimem_all_reduce_(param.grad, "sum", embed_pg.group_name)
-            handles[id(param)] = handle
+# if torch._inductor.config._fuse_ddp_communication:
+#     def pacghook(param):
+#         dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
+# else:
+if ASYNC_PG:
+    if FAKE_PG:
+        async_pg = torch.distributed.new_group(backend="fake")
     else:
-        def pacghook(param):
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        async_pg = torch.distributed.new_group(backend="nccl")
+
+    def pacghook(param):
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=async_pg)
+else:
+    def pacghook(param):
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
 
 if PACGHOOK:
@@ -676,26 +687,33 @@ model: nn.Module = torch.compile(model, backend=BACKEND, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+warmup_start = time.perf_counter()
 if rank == 0:
     print("starting warmup")
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    reset_handles()
     with ca_ctx():
         model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    optimizers[0].step()
-    for param in embed_params:
-        my_custom_wait(param)
-    optimizers[1].step()
-    for param in hidden_matrix_params:
-        my_custom_wait(param)
-    optimizers[2].step()
-    for param in head_params:
-        my_custom_wait(param)
-    for param in scalar_params:
-        my_custom_wait(param)
-    reset_handles()
+    if ASYNC_AR:
+        optimizers[0].step()
+        for param in head_params:
+            my_custom_wait(param)
+        for param in scalar_params:
+            my_custom_wait(param)
+        optimizers[1].step()
+        for param in hidden_matrix_params:
+            my_custom_wait(param)
+        optimizers[2].step()
+        for param in embed_params:
+            my_custom_wait(param)
+    else:
+        for opt in optimizers:
+            opt.step()
+
+
     model.zero_grad(set_to_none=True)
+if rank == 0:
+    print(f"warmed up after {1000 * (time.perf_counter() - warmup_start)} ms")
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
@@ -765,7 +783,6 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     with ca_ctx():
-        reset_handles()
         model(inputs, targets, get_window_size_blocks(step)).backward()
     if not PACGHOOK:
         for param in model.parameters():
@@ -778,27 +795,22 @@ for step in range(train_steps + 1):
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
-    optimizers[0].step()
-    for param in embed_params:
-        my_custom_wait(param)
-    optimizers[1].step()
-    for param in hidden_matrix_params:
-        my_custom_wait(param)
-    optimizers[2].step()
-    for param in head_params:
-        my_custom_wait(param)
-    for param in scalar_params:
-        my_custom_wait(param)
+    if ASYNC_AR:
+        optimizers[0].step()
+        for param in head_params:
+            my_custom_wait(param)
+        for param in scalar_params:
+            my_custom_wait(param)
+        optimizers[1].step()
+        for param in hidden_matrix_params:
+            my_custom_wait(param)
+        optimizers[2].step()
+        for param in embed_params:
+            my_custom_wait(param)
+    else:
+        for opt in optimizers:
+            opt.step()
     # null the gradients
-    trace_structured(
-        "artifact",
-        metadata_fn=lambda: {
-            "name": f"param_grad_order_actual_{step}",
-            "encoding": "json",
-        },
-        payload_fn=lambda: param_grad_order,
-    )
-    reset_handles()
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

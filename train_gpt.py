@@ -28,8 +28,14 @@ PACGHOOK = True
 ASYNC_AR = True
 if ASYNC_AR:
     assert PACGHOOK
-ASYNC_PG = False
+ASYNC_PG = True
 BACKEND="inductor"
+DDP = False
+WARMUP_FULL = False
+WARMUP_WINDOW = 885
+# 885
+if WARMUP_WINDOW != 0:
+    assert not WARMUP_FULL
 if CA:
     torch._dynamo.config.compiled_autograd = True
     # torch._inductor.config.reorder_for_locality = False
@@ -37,6 +43,10 @@ if CA:
     # These options actually slow things down further; but we should expect more speedups if we can fix them
     # torch._inductor.config.reorder_for_compute_comm_overlap = True
     # torch._inductor.config._fuse_ddp_communication = True
+    if torch._inductor.config._fuse_ddp_communication:
+        # OOM with async
+        assert not ASYNC_AR
+
     def ca_ctx():
         return torch._dynamo.compiled_autograd._enable(torch.compile(backend=BACKEND))
 else:
@@ -486,7 +496,7 @@ def get_iters():
     # if PROFILE:
     #     return 600
     if SHORT_RUN:
-        return 5
+        return 30
     return 1770
 
 @dataclass
@@ -521,6 +531,22 @@ if FAKE_PG:
     dist.init_process_group(backend="fake", rank=0, world_size=8, device_id=device, store=store)
 else:
     dist.init_process_group(backend="nccl", device_id=device)
+
+if ASYNC_PG:
+    print("CREATING ASYNC PG")
+    if FAKE_PG:
+        async_pg = torch.distributed.new_group(backend="fake")
+    else:
+        async_pg = torch.distributed.new_group(backend="nccl")
+    print("DONE CREATING ASYNC PG")
+
+dist.barrier()
+if ASYNC_PG:
+    test = torch.randn(10, 10, device="cuda")
+    print("test async_pg")
+    handle = dist.all_reduce(test, op=dist.ReduceOp.AVG, group=async_pg, async_op=True)
+    handle.wait()
+    print("done test async_pg")
 
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -582,7 +608,6 @@ adam_kwargs = {
     "betas": (0.8, 0.95),
     "eps": 1e-10,
     "fused": True,
-    "custom_wait": my_custom_wait,
 }
 param_to_optim = {}
 for param in embed_params:
@@ -654,29 +679,29 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-# if torch._inductor.config._fuse_ddp_communication:
-#     def pacghook(param):
-#         dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
-# else:
-if ASYNC_PG:
-    if FAKE_PG:
-        async_pg = torch.distributed.new_group(backend="fake")
-    else:
-        async_pg = torch.distributed.new_group(backend="nccl")
-
+if torch._inductor.config._fuse_ddp_communication:
+    assert not ASYNC_PG
     def pacghook(param):
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=async_pg)
+        dist.all_reduce(param.grad / world_size, op=dist.ReduceOp.SUM)
 else:
-    def pacghook(param):
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    if ASYNC_PG:
+        def pacghook(param):
+            if rank == 0:
+                print("attempting to launch on async_pg")
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=async_pg)
+    else:
+        def pacghook(param):
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
 
 if PACGHOOK:
-    for param in model.parameters():
-        param.register_post_accumulate_grad_hook(pacghook)
+    if not DDP:
+        for param in model.parameters():
+            param.register_post_accumulate_grad_hook(pacghook)
 # torch._dynamo.config.optimize_ddp = "python_reducer"
-# from torch.nn.parallel import DistributedDataParallel as DDP
-# model = DDP(model, bucket_cap_mb=2147483647)
+if DDP:
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    model = DDP(model, bucket_cap_mb=21474836470)
 model: nn.Module = torch.compile(model, backend=BACKEND, dynamic=False)
 
 ########################################
@@ -684,28 +709,37 @@ model: nn.Module = torch.compile(model, backend=BACKEND, dynamic=False)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
+if WARMUP_FULL:
+    warmup_steps = get_iters()
+else:
+    warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 warmup_start = time.perf_counter()
 if rank == 0:
     print("starting warmup")
-for _ in range(warmup_steps):
+for i in range(warmup_steps):
+    if rank == 0:
+        print(f"warmup step {i}")
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     with ca_ctx():
-        model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+        if WARMUP_FULL:
+            model(inputs.to(torch.int32), targets, get_window_size_blocks(i)).backward()
+        else:
+            model(inputs.to(torch.int32), targets, get_window_size_blocks(WARMUP_WINDOW)).backward()
     if ASYNC_AR:
         optimizers[0].step()
-        for param in head_params:
-            my_custom_wait(param)
-        for param in scalar_params:
-            my_custom_wait(param)
-        optimizers[1].step()
         for param in hidden_matrix_params:
             my_custom_wait(param)
+        optimizers[1].step()
         optimizers[2].step()
-        for param in embed_params:
-            my_custom_wait(param)
+
+        # for param in head_params:
+        #     my_custom_wait(param)
+        # for param in scalar_params:
+        #     my_custom_wait(param)
+        # for param in embed_params:
+        #     my_custom_wait(param)
     else:
         for opt in optimizers:
             opt.step()
@@ -797,16 +831,16 @@ for step in range(train_steps + 1):
     # step the optimizers
     if ASYNC_AR:
         optimizers[0].step()
-        for param in head_params:
-            my_custom_wait(param)
-        for param in scalar_params:
-            my_custom_wait(param)
-        optimizers[1].step()
         for param in hidden_matrix_params:
             my_custom_wait(param)
+        optimizers[1].step()
         optimizers[2].step()
-        for param in embed_params:
-            my_custom_wait(param)
+        # for param in head_params:
+        #     my_custom_wait(param)
+        # for param in scalar_params:
+        #     my_custom_wait(param)
+        # for param in embed_params:
+        #     my_custom_wait(param)
     else:
         for opt in optimizers:
             opt.step()

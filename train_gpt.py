@@ -128,7 +128,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -463,7 +463,9 @@ assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+from datetime import timedelta
+dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(seconds=30))
+# dist.init_process_group(backend="nccl", timeout=timedelta(seconds=30))
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 

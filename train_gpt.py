@@ -23,6 +23,7 @@ torch.empty(
 import torch._dynamo as dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
@@ -1257,7 +1258,15 @@ grad_accum_steps = 8 // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+
+fake_store = FakeStore()
+torch.distributed.init_process_group(
+    "fake",
+    store=fake_store,
+    rank=rank,
+    world_size=world_size,
+)
+
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
